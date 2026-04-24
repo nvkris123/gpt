@@ -31,6 +31,10 @@ print(decode(encode("hii there")))
 print(decode([33, 41]))
 
 import torch
+# device = "mps" if torch.backends.mps.is_available() else "cpu"
+device = "cpu"  # small model no benefit of mps
+print("device=", device)
+
 data = torch.tensor(encode(text), dtype=torch.long)
 print(data.shape, data.dtype)
 print(data[:100])
@@ -58,7 +62,7 @@ def get_batch(split):
   x = torch.stack([data[i:i+block_size] for i in ix])
   y = torch.stack([data[i+1:i+block_size+1] for i in ix])
 
-  return x, y
+  return x.to(device), y.to(device)
 
 xb, yb = get_batch("train")
 print(xb.shape, yb.shape)
@@ -106,13 +110,13 @@ class BigramLM(nn.Module):
       idx = torch.cat((idx, idx_next), dim=1)
     return idx
 
-m = BigramLM(vocab_size)
+m = BigramLM(vocab_size).to(device)
 out, loss = m(xb, yb)
 print("out=", out.shape)
 print("loss=", loss)
 
-idx = torch.zeros((1, 1), dtype=torch.long)
-print(decode(m.generate(idx, max_new_tokens=100)[0].tolist()))
+idx = torch.zeros((1, 1), dtype=torch.long, device=device)
+print(decode(m.generate(idx, max_new_tokens=100)[0].cpu().tolist()))
 
 print(m.parameters())
 print("-----")
@@ -128,5 +132,5 @@ for steps in range(10000):
 
 print(loss.item())
 
-idx = torch.zeros((1, 1), dtype=torch.long)
-print(decode(m.generate(idx, max_new_tokens=100)[0].tolist()))
+idx = torch.zeros((1, 1), dtype=torch.long, device=device)
+print(decode(m.generate(idx, max_new_tokens=100)[0].cpu().tolist()))
