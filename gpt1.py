@@ -7,19 +7,111 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+batch_size = 64
+block_size = 64
+max_iters = 5000
+eval_interval = 500
+learning_rate = 3e-4
+eval_iters = 200
+n_embd = 384
+n_layers = 6
+n_heads = 6
+dropout_rate = 0.2
+# device = "cpu"  # This small model is faster on CPU than MPS.
+device = "mps" if torch.backends.mps.is_available() else "cpu"
+
+class Head(nn.Module):
+  """one head of self attention"""
+
+  def __init__(self, head_size):
+    super().__init__()
+    self.key = nn.Linear(n_embd, head_size, bias=False)
+    self.query = nn.Linear(n_embd, head_size, bias=False)
+    self.value = nn.Linear(n_embd, head_size, bias=False)
+    self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+    self.dropout = nn.Dropout(dropout_rate)
+
+  def forward(self, x):
+    B, T, C = x.shape
+    k = self.key(x) # (B,T,C) -> (B,T,head_size)
+    q = self.query(x) # (B,T,C) -> (B,T,head_size)
+    v = self.value(x) # (B,T,C) -> (B,T,head_size)
+
+     # compute attention scores ("affinities")
+    wei = q @ k.transpose(-2, -1) # (B,T,head_size) @ (B,head_size,T) -> (B,T,T)
+    wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf")) # (B,T,T)
+    wei = F.softmax(wei, dim=-1) # (B,T,T)
+    wei = self.dropout(wei)
+
+    out = wei @ v # (B,T,T) @ (B,T,head_size) -> (B,T,head_size)
+    return out
+
+class MultiHeadAttention(nn.Module):
+  """multiple heads of self attention in parallel"""
+
+  def __init__(self, num_heads, head_size):
+    super().__init__()
+    self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+    self.proj = nn.Linear(n_embd, n_embd)
+    self.dropout = nn.Dropout(dropout_rate)
+
+  def forward(self, x):
+    out = torch.cat([h(x) for h in self.heads], dim=-1)
+    out = self.proj(out)
+    out = self.dropout(out)
+    return out
+
+class FeedForward(nn.Module):
+  """a simple linear layer followed by a non-linearity"""
+
+  def __init__(self, n_embd):
+    super().__init__()
+    self.net = nn.Sequential(
+      nn.Linear(n_embd, 4 * n_embd),
+      nn.ReLU(),
+      nn.Linear(4 * n_embd, n_embd),
+      nn.Dropout(dropout_rate)
+    )
+
+  def forward(self, x):
+    return self.net(x)
+
+class Block(nn.Module):
+  """Transformer block: communication followed by computation"""
+
+  def __init__(self, n_embd, num_heads):
+    super().__init__()
+    head_size = n_embd // num_heads
+    self.sa_heads = MultiHeadAttention(num_heads, head_size)
+    self.ffwd = FeedForward(n_embd)
+    self.ln1 = nn.LayerNorm(n_embd)
+    self.ln2 = nn.LayerNorm(n_embd)
+
+  def forward(self, x):
+    x = x + self.sa_heads(self.ln1(x))
+    x = x + self.ffwd(self.ln2(x))
+    return x
 
 class BigramLM(nn.Module):
   def __init__(self, vocab_size, n_embd):
     super().__init__()
     self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+    self.position_embedded_table = nn.Embedding(block_size, n_embd)
     print("embed table = ", self.token_embedding_table)
 
+    self.blocks = nn.Sequential(*[
+      Block(n_embd, num_heads=n_heads) for _ in range(n_layers)
+    ], nn.LayerNorm(n_embd))
     self.lm_head = nn.Linear(n_embd, vocab_size)
     print("lm head = ", self.lm_head)
 
   def forward(self, idx, targets=None):
-    tok_emb = self.token_embedding_table(idx)
-    logits = self.lm_head(tok_emb)
+    B, T = idx.shape
+    tok_emb = self.token_embedding_table(idx) # BTC
+    pos_emb = self.position_embedded_table(torch.arange(T, device=device))
+    x = tok_emb + pos_emb
+    x = self.blocks(x)
+    logits = self.lm_head(x)
     loss = None
 
     if targets is not None:
@@ -32,7 +124,8 @@ class BigramLM(nn.Module):
 
   def generate(self, idx, max_new_tokens):
     for _ in range(max_new_tokens):
-      logits, loss = self(idx)
+      idx_cond = idx[:, -block_size:] # crop context to the last block_size tokens
+      logits, loss = self(idx_cond)
       logits = logits[:, -1, :]
       probs = F.softmax(logits, dim=-1)
       idx_next = torch.multinomial(probs, num_samples=1)
@@ -42,15 +135,6 @@ class BigramLM(nn.Module):
 
 def main():
   torch.manual_seed(1337)
-
-  max_iters = 5000
-  eval_interval = 500
-  learning_rate = 1e-3
-  eval_iters = 200
-  batch_size = 32
-  block_size = 8
-  n_embd = 32
-  device = "cpu"  # This small model is faster on CPU than MPS.
 
   file_path = os.path.join("tiny-shakespeare-input.txt")
   with open(file_path, "r", encoding="utf-8") as f:
@@ -110,8 +194,8 @@ def main():
 
   xb, yb = get_batch("train")
   print(xb.shape, yb.shape)
-  print(xb)
-  print(yb)
+  # print(xb)
+  # print(yb)
   for b in range(batch_size):
     for t in range(block_size):
       context = xb[b, :t+1]
@@ -121,8 +205,8 @@ def main():
   model = BigramLM(vocab_size, n_embd).to(device)
   out, loss = model(xb, yb)
   print("out=", out.shape)
-  print("loss=", loss)
 
+  print("===Run #1")
   idx = torch.zeros((1, 1), dtype=torch.long, device=device)
   print(decode(model.generate(idx, max_new_tokens=100)[0].cpu().tolist()))
 
@@ -142,8 +226,56 @@ def main():
 
   print(loss.item())
 
+  print("===Run #Fin")
   idx = torch.zeros((1, 1), dtype=torch.long, device=device)
   print(decode(model.generate(idx, max_new_tokens=100)[0].cpu().tolist()))
+
+
+def main2():
+
+  torch.manual_seed(1337)
+  n_embd = 8
+  x = torch.randn(2, 4, n_embd)
+  print(x.shape)
+
+  # single head of self attention
+  head_size = 16
+  key = nn.Linear(n_embd, head_size, bias=False)
+  query = nn.Linear(n_embd, head_size, bias=False)
+  value = nn.Linear(n_embd, head_size, bias=False)
+  print(key.weight.shape)
+  print(key)
+  k = key(x)
+  print("kshape=", k.shape)
+  print(k)
+  q = query(x)
+  print("qshape=", q.shape)
+  print(q)
+  v = value(x)
+  print("vshape=", v.shape)
+  print(v)
+  wei = q @ k.transpose(-2, -1) # (BTC) @ (BCT) -> (BTT)
+  print("wei.shape=", wei.shape)
+  print(wei)
+
+
+  #sys.exit()
+
+  ones = torch.ones(4, 4)
+  print(ones)
+  tril = torch.tril(ones)
+  print(tril)
+
+  # wei = torch.zeros(4, 4)
+  # print(wei)
+  wei = wei.masked_fill(tril == 0, float("-inf"))
+  print("masked wei=", wei)
+  wei = F.softmax(wei, dim=-1)
+  print("softmaxed wei=", wei)
+  
+  v = wei @ v # (BTT) @ (BTC) -> (BTC)
+  print("out shape=", v.shape)
+  print("out=", v)
 
 
 if __name__ == "__main__":
