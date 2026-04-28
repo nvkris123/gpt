@@ -228,7 +228,7 @@ def main():
 
   print("===Run #Fin")
   idx = torch.zeros((1, 1), dtype=torch.long, device=device)
-  print(decode(model.generate(idx, max_new_tokens=100)[0].cpu().tolist()))
+  print(decode(model.generate(idx, max_new_tokens=10000)[0].cpu().tolist()))
 
 
 def main2():
